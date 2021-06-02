@@ -1,0 +1,301 @@
+diff --git a/llvm/lib/Target/X86/X86LoadValueInjectionLoadHardening.cpp b/llvm/lib/Target/X86/X86LoadValueInjectionLoadHardening.cpp
+index 50f8b3477acc..acc005039dde 100644
+--- a/llvm/lib/Target/X86/X86LoadValueInjectionLoadHardening.cpp
++++ b/llvm/lib/Target/X86/X86LoadValueInjectionLoadHardening.cpp
+@@ -103,6 +103,29 @@ static cl::opt<bool> EmitDotVerify(
+              "potential LVI gadgets, used for testing purposes only"),
+     cl::init(false), cl::Hidden);
+ 
++// WARNING: flags added to fine tuning the pass. In the final version,
++// FPVI should be a separate pass. If LVI is true we assume that
++// LVI-CFI and IND_THUNK passes are enabled
++
++// WARNING: this pass does not consider MDS as a possible threat.
++
++// LVI = true, FPVI = false must be used for:
++//  - LVI+CFI+IND_THUNK
++// LVI = false, FPVI = true must be used for:
++//  - FPVI
++// LVI = true, FPVI = true must be used for:
++//  - LVI+CFI+IND_THUNK+FPVI
++
++static cl::opt<bool> LVI(
++    PASS_KEY "-lvi",
++    cl::desc("Mitigate LVI."),
++    cl::init(false), cl::Hidden);
++
++static cl::opt<bool> FPVI(
++    PASS_KEY "-fpvi",
++    cl::desc("Mitigate FPVI."),
++    cl::init(false), cl::Hidden);
++
+ static llvm::sys::DynamicLibrary OptimizeDL;
+ typedef int (*OptimizeCutT)(unsigned int *nodes, unsigned int nodes_size,
+                             unsigned int *edges, int *edge_values,
+@@ -175,6 +198,8 @@ private:
+                    EdgeSet &CutEdges /* in, out */) const;
+   bool instrUsesRegToAccessMemory(const MachineInstr &I, unsigned Reg) const;
+   bool instrUsesRegToBranch(const MachineInstr &I, unsigned Reg) const;
++  bool instrUsesRegToRet(const MachineInstr &I, unsigned Reg) const;
++  inline bool mayFPAssist(MachineInstr *MI) const;
+   inline bool isFence(const MachineInstr *MI) const {
+     return MI && (MI->getOpcode() == X86::LFENCE ||
+                   (STI->useLVIControlFlowIntegrity() && MI->isCall()));
+@@ -322,6 +347,25 @@ bool X86LoadValueInjectionLoadHardeningPass::runOnMachineFunction(
+   return (FencesInserted > 0);
+ }
+ 
++bool X86LoadValueInjectionLoadHardeningPass::mayFPAssist(MachineInstr *MI) const
++{
++        const MachineFunction *MF = MI->getMF();
++        const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
++        const StringRef opcode = TII->getName(MI->getOpcode());
++        bool  AffectedOp = false;
++        //To the best of our knowledge only the following FP math operations
++        //are affected by FPVI
++        const std::string AffectedOps[] = {"add", "sub", "mul", "div", "sqrt"};
++
++        for(std::string Op : AffectedOps) {
++          if(opcode.find_lower(Op) != StringRef::npos) {
++            AffectedOp = true;
++            break;
++          }
++        }
++        return AffectedOp && MI->hasProperty(MCID::MayRaiseFPException);
++}
++
+ std::unique_ptr<MachineGadgetGraph>
+ X86LoadValueInjectionLoadHardeningPass::getGadgetGraph(
+     MachineFunction &MF, const MachineLoopInfo &MLI,
+@@ -365,6 +409,11 @@ X86LoadValueInjectionLoadHardeningPass::getGadgetGraph(
+           if (Transmitters.find(Def.Id) != Transmitters.end())
+             return; // Already analyzed `Def`
+ 
++          // Clobbered Defs should not be considered with FPVI pass
++          // since fencing is done on callee side
++          if((!LVI) && (Def.Addr->getFlags() & NodeAttrs::Clobbering))
++            return;
++
+           // Use RDF to find all the uses of `Def`
+           rdf::NodeSet Uses;
+           RegisterRef DefReg = DFG.getPRI().normalize(Def.Addr->getRegRef(DFG));
+@@ -400,15 +449,17 @@ X86LoadValueInjectionLoadHardeningPass::getGadgetGraph(
+             // uses to all defs unless the instruction is a call, in which
+             // case all arguments will be treated as gadget sources during
+             // analysis of the callee function.
+-            if (UseMI.isCall())
++            // For FPVI we need to analyze calls since we fence call-sites
++            if ((!FPVI) && UseMI.isCall())
+               continue;
+ 
+             // Check whether this use can transmit (leak) its value.
+             if (instrUsesRegToAccessMemory(UseMI, UseMO.getReg()) ||
+-                (!NoConditionalBranches &&
+-                 instrUsesRegToBranch(UseMI, UseMO.getReg()))) {
++                instrUsesRegToRet(UseMI, UseMO.getReg()) ||
++                (!NoConditionalBranches && instrUsesRegToBranch(UseMI, UseMO.getReg()))
++               ) {
+               Transmitters[Def.Id].push_back(Use.Addr->getOwner(DFG).Id);
+-              if (UseMI.mayLoad())
++              if (LVI && UseMI.mayLoad())
+                 continue; // Found a transmitting load -- no need to continue
+                           // traversing its defs (i.e., this load will become
+                           // a new gadget source anyways).
+@@ -467,12 +518,16 @@ X86LoadValueInjectionLoadHardeningPass::getGadgetGraph(
+   };
+ 
+   LLVM_DEBUG(dbgs() << "Analyzing def-use chains to find gadgets\n");
+-  // Analyze function arguments
+-  NodeAddr<BlockNode *> EntryBlock = DFG.getFunc().Addr->getEntryBlock(DFG);
+-  for (NodeAddr<PhiNode *> ArgPhi :
+-       EntryBlock.Addr->members_if(DataFlowGraph::IsPhi, DFG)) {
+-    NodeList Defs = ArgPhi.Addr->members_if(DataFlowGraph::IsDef, DFG);
+-    llvm::for_each(Defs, AnalyzeDef);
++  //For FPVI arguments are not tainted since we fence on caller side
++  if(LVI)
++  {
++      // Analyze function arguments
++      NodeAddr<BlockNode *> EntryBlock = DFG.getFunc().Addr->getEntryBlock(DFG);
++      for (NodeAddr<PhiNode *> ArgPhi :
++           EntryBlock.Addr->members_if(DataFlowGraph::IsPhi, DFG)) {
++        NodeList Defs = ArgPhi.Addr->members_if(DataFlowGraph::IsDef, DFG);
++        llvm::for_each(Defs, AnalyzeDef);
++      }
+   }
+   // Analyze every instruction in MF
+   for (NodeAddr<BlockNode *> BA : DFG.getFunc().Addr->members(DFG)) {
+@@ -482,7 +537,9 @@ X86LoadValueInjectionLoadHardeningPass::getGadgetGraph(
+       if (isFence(MI)) {
+         MaybeAddNode(MI);
+         ++FenceCount;
+-      } else if (MI->mayLoad()) {
++      } else if ( (LVI   && MI->mayLoad()   ) ||
++                  (FPVI  && mayFPAssist(MI) )
++                ) {
+         NodeList Defs = SA.Addr->members_if(DataFlowGraph::IsDef, DFG);
+         llvm::for_each(Defs, AnalyzeDef);
+       }
+@@ -734,39 +791,66 @@ int X86LoadValueInjectionLoadHardeningPass::insertFences(
+     MachineFunction &MF, MachineGadgetGraph &G,
+     EdgeSet &CutEdges /* in, out */) const {
+   int FencesInserted = 0;
+-  for (const auto &N : G.nodes()) {
+-    for (const auto &E : N.edges()) {
+-      if (CutEdges.contains(E)) {
+-        MachineInstr *MI = N.getValue(), *Prev;
+-        MachineBasicBlock *MBB;                  // Insert an LFENCE in this MBB
+-        MachineBasicBlock::iterator InsertionPt; // ...at this point
+-        if (MI == MachineGadgetGraph::ArgNodeSentinel) {
+-          // insert LFENCE at beginning of entry block
+-          MBB = &MF.front();
+-          InsertionPt = MBB->begin();
+-          Prev = nullptr;
+-        } else if (MI->isBranch()) { // insert the LFENCE before the branch
++
++  MachineInstr *MI, *Prev;
++  MachineBasicBlock *MBB;                  // Insert an LFENCE in this MBB
++  MachineBasicBlock::iterator InsertionPt; // ...at this point
++
++  //For FPVI only we insert lfences before every sink
++  if(FPVI && !LVI)
++  {
++    for (const auto &N : G.nodes()) {
++      for (const auto &E : N.edges()) {
++        if (E.getValue() < 0) {
++          MI = E.getDest()->getValue();
+           MBB = MI->getParent();
+           InsertionPt = MI;
+           Prev = MI->getPrevNode();
+-          // Remove all egress CFG edges from this branch because the inserted
+-          // LFENCE prevents gadgets from crossing the branch.
+-          for (const auto &E : N.edges()) {
+-            if (MachineGadgetGraph::isCFGEdge(E))
+-              CutEdges.insert(E);
++          // Ensure this insertion is not redundant (two LFENCEs in sequence).
++          if ((InsertionPt == MBB->end() || !isFence(&*InsertionPt)) &&
++                  (!Prev || !isFence(Prev))) {
++              BuildMI(*MBB, InsertionPt, DebugLoc(), TII->get(X86::LFENCE));
++              ++FencesInserted;
+           }
+-        } else { // insert the LFENCE after the instruction
+-          MBB = MI->getParent();
+-          InsertionPt = MI->getNextNode() ? MI->getNextNode() : MBB->end();
+-          Prev = InsertionPt == MBB->end()
+-                     ? (MBB->empty() ? nullptr : &MBB->back())
+-                     : InsertionPt->getPrevNode();
+         }
+-        // Ensure this insertion is not redundant (two LFENCEs in sequence).
+-        if ((InsertionPt == MBB->end() || !isFence(&*InsertionPt)) &&
+-            (!Prev || !isFence(Prev))) {
+-          BuildMI(*MBB, InsertionPt, DebugLoc(), TII->get(X86::LFENCE));
+-          ++FencesInserted;
++      }
++    }
++  }
++  //Otherwise standard LVI behaviour
++  else
++  {
++    for (const auto &N : G.nodes()) {
++      for (const auto &E : N.edges()) {
++        if (CutEdges.contains(E)) {
++          MI = N.getValue();
++          if (MI == MachineGadgetGraph::ArgNodeSentinel) {
++            // insert LFENCE at beginning of entry block
++            MBB = &MF.front();
++            InsertionPt = MBB->begin();
++            Prev = nullptr;
++          } else if (MI->isBranch()) { // insert the LFENCE before the branch
++            MBB = MI->getParent();
++            InsertionPt = MI;
++            Prev = MI->getPrevNode();
++            // Remove all egress CFG edges from this branch because the inserted
++            // LFENCE prevents gadgets from crossing the branch.
++            for (const auto &E : N.edges()) {
++              if (MachineGadgetGraph::isCFGEdge(E))
++                CutEdges.insert(E);
++            }
++          } else { // insert the LFENCE after the instruction
++            MBB = MI->getParent();
++            InsertionPt = MI->getNextNode() ? MI->getNextNode() : MBB->end();
++            Prev = InsertionPt == MBB->end()
++                       ? (MBB->empty() ? nullptr : &MBB->back())
++                       : InsertionPt->getPrevNode();
++          }
++          // Ensure this insertion is not redundant (two LFENCEs in sequence).
++          if ((InsertionPt == MBB->end() || !isFence(&*InsertionPt)) &&
++              (!Prev || !isFence(Prev))) {
++            BuildMI(*MBB, InsertionPt, DebugLoc(), TII->get(X86::LFENCE));
++            ++FencesInserted;
++          }
+         }
+       }
+     }
+@@ -779,6 +863,14 @@ bool X86LoadValueInjectionLoadHardeningPass::instrUsesRegToAccessMemory(
+   if (!MI.mayLoadOrStore() || MI.getOpcode() == X86::MFENCE ||
+       MI.getOpcode() == X86::SFENCE || MI.getOpcode() == X86::LFENCE)
+     return false;
++  
++  //In case of FPVI only pass:
++  // - Loads  are considered as a possible sink as an approximation
++  //   to cover the case FP+Load+Transmit. Please notice that if we
++  //   do not assume MDS as a threat, FP+Load is not a gadget.
++  // - Stores are not considered as a possible sink since we assume
++  //   MDS is not a threat
++  if(FPVI && !LVI && MI.mayStore()) return false;
+ 
+   // FIXME: This does not handle pseudo loading instruction like TCRETURN*
+   const MCInstrDesc &Desc = MI.getDesc();
+@@ -803,11 +895,48 @@ bool X86LoadValueInjectionLoadHardeningPass::instrUsesRegToAccessMemory(
+ 
+ bool X86LoadValueInjectionLoadHardeningPass::instrUsesRegToBranch(
+     const MachineInstr &MI, unsigned Reg) const {
+-  if (!MI.isConditionalBranch())
+-    return false;
+-  for (const MachineOperand &Use : MI.uses())
+-    if (Use.isReg() && Use.getReg() == Reg)
+-      return true;
++
++
++//Legend:
++//  L: case protected by LVI+CFI+INDIRECT_THUNK passes
++//  F: case protected by FPVI pass
++//  -: not a threat
++//
++//                       |  IND BR      COND BR     DIR. CALL
++//-----------------------|-----------------------------------
++//LVI+CFI+IND_THUNK      |  L           L           L
++//FPVI                   |  F           -           F
++//LVI+CFI+IND_THUNK+FPVI |  L           L           L
++
++  if (LVI && MI.isConditionalBranch()) {
++    for (const MachineOperand &Use : MI.uses()) {
++      if (Use.isReg() && Use.getReg() == Reg) {
++        return true;
++      }
++    }
++  }
++
++  if ( FPVI && !STI->useIndirectThunkCalls() && (MI.isCall() || MI.isIndirectBranch()) ) {
++    for (const MachineOperand &Use : MI.uses()) {
++      if (Use.isReg() && Use.getReg() == Reg) {
++        return true;
++      }
++    }
++  }
++
++  return false;
++}
++
++bool X86LoadValueInjectionLoadHardeningPass::instrUsesRegToRet(
++    const MachineInstr &MI, unsigned Reg) const {
++  if ((!STI->useLVIControlFlowIntegrity()) && FPVI && MI.isReturn()) {
++    for (const MachineOperand &Use : MI.uses()) {
++      if (Use.isReg() && Use.getReg() == Reg) {
++        return true;
++      }
++    }
++  }
++
+   return false;
+ }
+ 

