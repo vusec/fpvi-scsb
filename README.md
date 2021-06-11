@@ -4,9 +4,12 @@ This repository contains test code, examples and exploits regarding transient wi
 
 For more information about our work:
 
-* Project page: [https://www.vusec.net/projects/fpvi-scsb](https://www.vusec.net/projects/fpvi-scsb)
-* Paper PDF: [http://download.vusec.net/papers/fpvi-scsb_sec21.pdf](http://download.vusec.net/papers/fpvi-scsb_sec21.pdf)
-* Intel security advisory on FPVI (CVE-2021-0086) and SCSB (CVE-2021-0089): [https://www.intel.com/content/www/us/en/security-center/advisory/intel-sa-00516.html](https://www.intel.com/content/www/us/en/security-center/advisory/intel-sa-00516.html)
+* More details on [www.vusec.net/projects/fpvi-scsb](https://www.vusec.net/projects/fpvi-scsb)
+* [Intel security advisory on FPVI (CVE-2021-0086) and SCSB (CVE-2021-0089)](https://www.intel.com/content/www/us/en/security-center/advisory/intel-sa-00516.html)
+* [Affected Intel CPUs (Columns FPVI & SCSB)](https://software.intel.com/content/www/us/en/develop/topics/software-security-guidance/processors-affected-consolidated-product-cpu-model.html)
+* [AMD security advisory on FPVI (CVE-2021-26314) and SCSB (CVE-2021-26313)](https://www.amd.com/en/corporate/product-security/bulletin/AMD-sb-1003)
+* [ARM confirming some FPU implementations being vulnerable to FPVI](https://developer.arm.com/support/arm-security-updates/speculative-processor-vulnerability/frequently-asked-questions#fvpi)
+* [Xen security advisory on SCSB](https://xenbits.xen.org/xsa/advisory-375.html)
 
 ## Setup and Environment
 
